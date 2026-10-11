@@ -898,18 +898,48 @@ def _takes_min_confidence(runner: Any, fn_name: str = "predict_batch") -> bool:
     return any(p.name == "min_confidence" or p.kind is p.VAR_KEYWORD for p in params)
 
 
+def _takes_model(runner: Any, fn_name: str = "predict") -> bool:
+    """Whether `runner`'s entry point accepts the routing argument `evaluate` forwards.
+
+    The same signature check `_batch_form` makes, applied to whichever entry point the harness is
+    about to call. `_batch_form` already asks this of ``predict_batch`` -- its docstring records
+    the ``TypeError: ... unexpected keyword argument 'model'`` that made the check necessary --
+    but its fallback scores the run one ``predict`` at a time, and that call forwarded `model`
+    with no check of its own. A single-checkpoint `Agent` (whose ``predict`` is `system_one`, with
+    no `model` parameter) therefore failed on every row, and under ``on_error="skip"`` the failure
+    surfaced only as a report with zero cases and an empty ``overall``.
+
+    Not introspectable (a C-level or hand-rolled ``__call__``): keep the call this harness made
+    before the shape was checked, the same way `_batch_form` does.
+    """
+    fn = getattr(runner, fn_name, None)
+    if fn is None:
+        return False
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(p.name == "model" or p.kind is p.VAR_KEYWORD for p in params)
+
+
 def evaluate(runner: Any, dataset: Dataset, evaluators: Optional[Sequence[Evaluator]] = None,
              batch_size: Optional[int] = None, on_error: str = "fail",
              config: Optional[Dict[str, Any]] = None, sort_by_length: bool = False,
              min_confidence: Optional[float] = None) -> EvalReport:
     """Run `runner` over `dataset`, aggregating per-answer metrics overall and per slice.
 
-    `runner` needs a ``predict(state, questions, model=...)`` method, and for `batch_size` above 1
-    a ``predict_batch`` in either shape the repo ships: the positional
+    `runner` needs a ``predict(state, questions)`` method, and for `batch_size` above 1 a
+    ``predict_batch`` in either shape the repo ships: the positional
     ``predict_batch(states, questions, model=..., batch_size=...)``, or the per-request-dict form
     `Router.predict_batch` takes -- ``predict_batch([{"state": ..., "questions": ...,
     "model": ...}, ...], batch_size=...)``. A runner that offers neither is scored one ``predict``
     at a time, which is slower but not wrong.
+
+    ``model`` is sent only to an entry point whose signature takes it, checked per entry point:
+    `Router` routes between checkpoints, while a single-checkpoint `Agent` has nothing to route
+    and its ``predict`` (`system_one`) has no such parameter. A dataset whose examples name a
+    model needs a runner that can route, and says so in a pre-flight `EvalError` rather than
+    scoring the wrong checkpoint or failing per row.
 
     `sort_by_length` is forwarded to a chunked runner so similarly sized examples share a forward
     pass and pad to a shorter maximum. It reaches the checkpoint's own batching only when the
@@ -992,6 +1022,26 @@ def evaluate(runner: Any, dataset: Dataset, evaluators: Optional[Sequence[Evalua
     # for nothing.
     if mc is not None and batch_form:
         shape = dict(shape, min_confidence=mc)
+    # `model` is decided the same way, and per entry point, because the two are reached
+    # differently: a batched run still sends a chunk of one through `predict`, so a runner whose
+    # `predict_batch` routes while its `predict` does not would pass or fail by how the rows
+    # happened to group -- `batch_size=1`, or any two consecutive examples differing in
+    # (model, questions), lands on the single path. Dropping the argument is only safe when the
+    # run never asks for routing; when it does, the refusal below says so before any call.
+    routed = next((i for i, e in enumerate(examples) if e.model is not None), None)
+    send_model = {name: _takes_model(runner, name) for name in ("predict", "predict_batch")}
+    # Only the entry points that take `model` as a KEYWORD are required to accept one: the
+    # per-request form carries it inside each dict, so `Router.predict_batch(requests, ...)`
+    # routes perfectly well with no such parameter in its signature.
+    if routed is not None:
+        for name in (["predict"] + (["predict_batch"] if batch_form == _BATCH_STATES else [])):
+            if not send_model[name]:
+                raise EvalError(
+                    "evaluate() refused: example %d names model %r, but this runner's %s does not "
+                    "accept a `model` argument. Either use a Router that can route between "
+                    "checkpoints, or drop `model` from the dataset -- the report would otherwise "
+                    "name a checkpoint the run never reached."
+                    % (routed, examples[routed].model, name))
 
     index = 0
     while index < len(examples):
@@ -1028,15 +1078,16 @@ def evaluate(runner: Any, dataset: Dataset, evaluators: Optional[Sequence[Evalua
                         [{"state": e.state, "questions": e.questions, "model": e.model}
                          for e in chunk], batch_size=batch_size, **shape)
                 else:
+                    batch_model = {"model": chunk[0].model} if send_model["predict_batch"] else {}
                     results = runner.predict_batch([e.state for e in chunk], chunk[0].questions,
-                                                   model=chunk[0].model, batch_size=batch_size,
-                                                   **shape)
+                                                   batch_size=batch_size, **batch_model, **shape)
             else:
                 # A chunk of one still sees the gate: the pre-flight refusal proved `predict`
                 # accepts it whenever `mc` is set, so nothing here has to re-check the signature.
                 single_kwargs = {"min_confidence": mc} if mc is not None else {}
-                results = [runner.predict(chunk[0].state, chunk[0].questions,
-                                          model=chunk[0].model, **single_kwargs)]
+                if send_model["predict"]:
+                    single_kwargs["model"] = chunk[0].model
+                results = [runner.predict(chunk[0].state, chunk[0].questions, **single_kwargs)]
         except Exception as exc:  # noqa: BLE001 -- honoured by on_error
             if on_error == "fail":
                 raise

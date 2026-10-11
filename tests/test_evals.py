@@ -1043,6 +1043,81 @@ def test_a_pass_through_wrapper_is_given_the_knob():
     assert report.config["timing"]["sort_by_length_sent"] is True
 
 
+# ------------------------------------------------------- the `model` argument per entry point
+#
+# `evaluate` forwards `Example.model` so a `Router` can route between checkpoints. A
+# single-checkpoint `Agent` has nothing to route and its `predict` (an alias of `system_one`) has
+# no such parameter, so the argument is sent only where the signature takes it -- checked per entry
+# point, because a batched run still sends a chunk of one through `predict`.
+
+
+class AgentShaped(StubRunner):
+    """`laya.Agent`: neither entry point takes `model`."""
+
+    def predict(self, state, questions):
+        return {"model": "agent", "answers": self.by_state[state]}
+
+    def predict_batch(self, states, questions, batch_size=None):
+        return [{"model": "agent", "answers": self.by_state[s]} for s in states]
+
+
+class BatchOnlyRouting(StubRunner):
+    """Routes in the batch entry point but not in the single one -- the shape `_batch_form` approves."""
+
+    def predict(self, state, questions):
+        return {"model": "single", "answers": self.by_state[state]}
+
+    def predict_batch(self, states, questions, model=None, batch_size=None):
+        return [{"model": model or "batched", "answers": self.by_state[s]} for s in states]
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 8])
+def test_an_agent_shaped_runner_is_scored_at_every_batch_size(batch_size):
+    """`Agent.predict` has no `model`; forwarding it made every row a TypeError."""
+    report = evaluate(AgentShaped(ANSWERS3), _three(), evaluators=[ChoiceAccuracy()],
+                      batch_size=batch_size)
+    assert report.overall["choice_accuracy"] == 1.0
+    assert not report.config.get("errored")
+
+
+def test_a_runner_that_routes_only_in_batch_survives_a_chunk_of_one():
+    """Chunking splits on (model, questions), so a differing row lands on the single `predict`."""
+    mixed = Dataset([Example("s1", Q, {"intent": "a"}),
+                     Example("s3", QNOUL, {"flag": True}),
+                     Example("s2", Q, {"intent": "a"})])
+    answers = {"s1": {"intent": choice_answer("a")}, "s2": {"intent": choice_answer("a")},
+               "s3": {"flag": noul_answer(0.9)}}
+    report = evaluate(BatchOnlyRouting(answers), mixed,
+                      evaluators=[ChoiceAccuracy(), NoulAccuracy()], batch_size=8)
+    assert not report.config.get("errored")
+    assert report.overall["choice_accuracy"] == 1.0
+
+
+def test_a_dataset_that_names_a_model_refuses_a_runner_that_cannot_route():
+    """Dropping the argument there would score a checkpoint the run never reached."""
+    dataset = Dataset([Example("s1", Q, {"intent": "a"}),
+                       Example("s2", Q, {"intent": "a"}, model="other-ckpt")])
+    with pytest.raises(EvalError) as exc:
+        evaluate(AgentShaped(ANSWERS3), dataset, evaluators=[ChoiceAccuracy()], batch_size=8)
+    message = str(exc.value)
+    assert "example 1" in message and "other-ckpt" in message and "predict" in message
+
+
+def test_a_routing_runner_still_receives_the_model():
+    """The fix must not stop `Router` from being routed."""
+    seen = []
+
+    class Routing(StubRunner):
+        def predict(self, state, questions, model=None):
+            seen.append(model)
+            return {"model": model, "answers": self.by_state[state]}
+
+    dataset = Dataset([Example("s1", Q, {"intent": "a"}, model="ckpt-a")])
+    report = evaluate(Routing(ANSWERS3), dataset, evaluators=[ChoiceAccuracy()], batch_size=1)
+    assert seen == ["ckpt-a"]
+    assert report.cases[0]["model"] == "ckpt-a"
+
+
 # ------------------------------------------------------- abstention gate (#361 knob)
 #
 # `Router.predict` / `Router.predict_batch` and `ONNXAgent.predict` gate on `answer_confidence`
